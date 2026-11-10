@@ -1,0 +1,1044 @@
+---
+title: "Statement_Fraud_Detection"
+author: "Thi Hang My Le"
+date: "2026-11-07"
+output: html_document
+
+**Transaction Fraud Detection Analysis**
+
+This project cleans transaction data, prepares features for machine learning, and compares Logistic Regression and Random Forest models for fraud prediction.
+
+**1. Setup and Load Data**
+```{r,echo=TRUE,results='hide', warning=FALSE, message=FALSE}
+
+setwd("C:/Users/lemy1/OneDrive/Datalearn/transaction/markdown")
+
+list.files()
+packages <- c(
+  "tidyverse",
+  "tidymodels",
+  "readxl",
+  "dplyr",
+  "rsample",
+  "ranger",
+  "lubridate"
+)
+
+install.packages(
+  packages,
+  repos = "https://cloud.r-project.org"
+)
+
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(rsample)
+library(tidymodels)
+library(ranger)
+
+customers <- read_excel("customers.xltx")
+merchants <- read_excel("merchants.xltx")
+transactions_train <- read_excel("transactions_train.xltx")
+transactions_eval <- read_excel("transactions_eval.xltx")
+```
+```{r,echo=TRUE}
+head(customers)
+```
+```{r,echo=TRUE}
+head(merchants)
+```
+```{r,echo=TRUE}
+head(transactions_train)
+```
+
+```{r,echo=TRUE}
+head(transactions_eval)
+```
+
+**2. Data Cleaning and Validation**
+
+**2.1 Check Missing Values**
+
+```{r,echo=TRUE}
+check_missing <- function(data, dataset_name) {
+  
+  data.frame(
+    Dataset = dataset_name,
+    Column = names(data),
+    Total_Rows = nrow(data),
+    Missing_Count = colSums(is.na(data)),
+    Missing_Percent = round(
+      colSums(is.na(data)) / nrow(data) * 100,
+      2
+    )
+  )
+}
+missing_customers <- check_missing(
+  customers,
+  "Customers"
+)
+
+missing_merchants <- check_missing(
+  merchants,
+  "Merchants"
+)
+
+missing_train <- check_missing(
+  transactions_train,
+  "Transactions Train"
+)
+
+missing_eval <- check_missing(
+  transactions_eval,
+  "Transactions Evaluation"
+)
+
+missing_summary <- bind_rows(
+  missing_customers,
+  missing_merchants,
+  missing_train,
+  missing_eval
+)
+
+missing_summary
+```
+**2.2 Remove Exact Duplicate Rows**
+```{r,echo=TRUE}
+valid_customers <- distinct(customers)
+
+valid_merchants <- distinct(merchants)
+
+transactions_train_clean <- distinct(
+  transactions_train
+)
+
+transactions_eval_clean <- distinct(
+  transactions_eval
+)
+
+sum(duplicated(transactions_train_clean))
+```
+
+**2.3 Check Duplicate Transaction IDs**
+
+```{r,echo=TRUE}
+sum(
+  duplicated(
+    transactions_train_clean$transaction_id
+  )
+)
+
+duplicate_transactions_id <- transactions_train_clean %>%
+  add_count(transaction_id) %>%
+  filter(n > 1)
+
+duplicate_transactions_id
+```
+
+**2.4 Check Transaction and Fraud Distribution**
+```{r,echo=TRUE}
+n_distinct(
+  transactions_train_clean$transaction_id
+)
+
+table(
+  transactions_train_clean$is_fraud
+)
+
+prop.table(
+  table(transactions_train_clean$is_fraud)
+) * 100
+```
+
+**2.5 Validate Duplicate Transactions**
+
+This section checks whether duplicate transaction IDs contain valid customer and merchant IDs.
+
+```{r,echo=TRUE}
+duplicate_check <- duplicate_transactions_id %>%
+  left_join(
+    valid_customers %>%
+      mutate(customer_exists = TRUE),
+    by = "customer_id"
+  ) %>%
+  left_join(
+    valid_merchants %>%
+      mutate(merchant_exists = TRUE),
+    by = "merchant_id"
+  ) %>%
+  mutate(
+    customer_exists = ifelse(
+      is.na(customer_exists),
+      FALSE,
+      TRUE
+    ),
+    merchant_exists = ifelse(
+      is.na(merchant_exists),
+      FALSE,
+      TRUE
+    )
+  ) %>%
+  select(
+    transaction_id,
+    customer_id,
+    merchant_id,
+    customer_exists,
+    merchant_exists,
+    transaction_amount,
+    is_fraud
+  )
+
+duplicate_check
+```
+
+**2.6 Summarize Duplicate Transactions**
+
+```{r,echo=TRUE}
+duplicate_check %>%
+  group_by(transaction_id) %>%
+  summarise(
+    rows = n(),
+    valid_rows = sum(
+      customer_exists & merchant_exists
+    ),
+    orphan_rows = sum(
+      !customer_exists | !merchant_exists
+    ),
+    fraud_labels = n_distinct(is_fraud),
+    .groups = "drop"
+  ) %>%
+  count(
+    valid_rows,
+    orphan_rows,
+    fraud_labels
+  )
+```
+**2.7 Check for Conflicting Fraud Labels**
+
+```{r,echo=TRUE}
+duplicate_check %>%
+  group_by(transaction_id) %>%
+  filter(n() > 1) %>%
+  summarise(
+    fraud_labels = paste(
+      unique(is_fraud),
+      collapse = ", "
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(
+    grepl(",", fraud_labels)
+  )
+```
+
+**2.8 Keep Valid Transactions**
+
+Only transactions with valid customer and merchant IDs are retained.
+```{r,echo=TRUE}
+transactions_train_clean <- transactions_train_clean %>%
+  semi_join(
+    valid_customers,
+    by = "customer_id"
+  ) %>%
+  semi_join(
+    valid_merchants,
+    by = "merchant_id"
+  ) %>%
+  distinct(
+    transaction_id,
+    .keep_all = TRUE
+  )
+
+sum(
+  duplicated(
+    transactions_train_clean$transaction_id
+  )
+)
+```
+**2.9 Check Missing Values in Cleaned Training Data**
+```{r,echo=TRUE}
+missing_train_clean <- data.frame(
+  column = names(
+    transactions_train_clean
+  ),
+  missing_count = colSums(
+    is.na(transactions_train_clean)
+  ),
+  missing_percent = round(
+    colMeans(
+      is.na(transactions_train_clean)
+    ) * 100,
+    2
+  )
+)
+
+missing_train_clean
+```
+**3. Check and Handle Unusual Values**
+
+**3.1 Transaction Amount**
+```{r,echo=TRUE}
+summary(
+  transactions_train_clean$transaction_amount
+)
+
+sum(
+  transactions_train_clean$transaction_amount < 0,
+  na.rm = TRUE
+)
+```
+**3.2 Distance from Home**
+```{r,echo=TRUE}
+summary(
+  transactions_train_clean$distance_from_home_miles
+)
+
+sum(
+  transactions_train_clean$distance_from_home_miles < 0,
+  na.rm = TRUE
+)
+```
+
+**3.3 Hours Since Last Transaction**
+```{r,echo=TRUE}
+summary(
+  transactions_train_clean$hours_since_last_txn
+)
+```
+**3.4 Ratio to Median Purchase**
+```{r,echo=TRUE}
+summary(
+  transactions_train_clean$ratio_to_median_purchase
+)
+```
+**3.5 Number of Transactions in the Last 24 Hours**
+```{r,echo=TRUE}
+summary(
+  transactions_train_clean$num_txns_last_24h
+)
+```
+**3.6 Compare Unusual Values by Fraud Status**
+```{r,echo=TRUE}
+fraud_status_summary <- transactions_train_clean %>%
+  group_by(is_fraud) %>%
+  summarise(
+    total_transactions = n(),
+    negative_amount = sum(
+      transaction_amount < 0,
+      na.rm = TRUE
+    ),
+    negative_distance = sum(
+      distance_from_home_miles < 0,
+      na.rm = TRUE
+    ),
+    average_amount = mean(
+      transaction_amount,
+      na.rm = TRUE
+    ),
+    average_distance = mean(
+      distance_from_home_miles,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+fraud_status_summary
+```
+
+**3.7 Handle Negative Values**
+
+Negative values are flagged and replaced with missing values.
+```{r,echo=TRUE}
+transactions_train_clean <- transactions_train_clean %>%
+  mutate(
+    amount_negative_flag = if_else(
+      !is.na(transaction_amount) &
+        transaction_amount < 0,
+      1L,
+      0L
+    ),
+
+    distance_negative_flag = if_else(
+      !is.na(distance_from_home_miles) &
+        distance_from_home_miles < 0,
+      1L,
+      0L
+    ),
+
+    transaction_amount = if_else(
+      transaction_amount < 0,
+      NA_real_,
+      transaction_amount
+    ),
+
+    distance_from_home_miles = if_else(
+      distance_from_home_miles < 0,
+      NA_real_,
+      distance_from_home_miles
+    )
+  )
+
+transactions_train_clean %>%
+  summarise(
+    negative_amount_left = sum(
+      transaction_amount < 0,
+      na.rm = TRUE
+    ),
+    negative_distance_left = sum(
+      distance_from_home_miles < 0,
+      na.rm = TRUE
+    ),
+    amount_flags = sum(
+      amount_negative_flag
+    ),
+    distance_flags = sum(
+      distance_negative_flag
+    )
+  )
+```
+**4. Merge Data Tables**
+
+**4.1 Prepare Customer and Merchant Data**
+```{r,echo=TRUE}
+customers_join <- valid_customers %>%
+  distinct(
+    customer_id,
+    .keep_all = TRUE
+  )
+
+merchants_join <- valid_merchants %>%
+  distinct(
+    merchant_id,
+    .keep_all = TRUE
+  )
+```
+**4.2 Join Transaction, Customer, and Merchant Data**
+```{r,echo=TRUE}
+train_data <- transactions_train_clean %>%
+  left_join(
+    customers_join,
+    by = "customer_id"
+  ) %>%
+  left_join(
+    merchants_join,
+    by = "merchant_id"
+  )
+
+head(train_data)
+```
+**4.3 Check Missing Values After Joining**
+```{r,echo=TRUE}
+missing_joined <- data.frame(
+  column = names(train_data),
+  missing_count = colSums(
+    is.na(train_data)
+  ),
+  missing_percent = round(
+    colMeans(
+      is.na(train_data)
+    ) * 100,
+    2
+  )
+)
+
+missing_joined
+```
+**5. Feature Engineering and Data Preparation**
+
+**5.1 Select Model Features**
+```{r,echo=TRUE}
+model_data <- train_data %>%
+  select(
+    transaction_id,
+    is_fraud,
+    transaction_amount,
+    transaction_datetime,
+    is_online,
+    card_present,
+    distance_from_home_miles,
+    hours_since_last_txn,
+    ratio_to_median_purchase,
+    num_txns_last_24h,
+    amount_negative_flag,
+    distance_negative_flag,
+    account_age_days,
+    merchant_category,
+    is_international
+  )
+
+head(model_data)
+```
+
+**5.2 Normalize Categorical Variables**
+```{r,echo=TRUE}
+model_data <- model_data %>%
+  mutate(
+    is_online = str_to_lower(
+      trimws(is_online)
+    ),
+    card_present = str_to_lower(
+      trimws(card_present)
+    ),
+    is_international = str_to_lower(
+      trimws(is_international)
+    ),
+    merchant_category = str_to_lower(
+      trimws(merchant_category)
+    )
+  )
+
+head(model_data)
+```
+**5.3 Create Time-Based Features**
+```{r,echo=TRUE}
+model_data <- model_data %>%
+  mutate(
+    transaction_hour = hour(
+      transaction_datetime
+    ),
+    transaction_day = wday(
+      transaction_datetime,
+      label = TRUE
+    ),
+    transaction_month = month(
+      transaction_datetime
+    )
+  ) %>%
+  select(
+    -transaction_datetime
+  )
+
+head(model_data)
+```
+**5.4 Split Data into Training and Testing Sets**
+```{r,echo=TRUE}
+set.seed(123)
+
+data_split <- initial_split(
+  model_data,
+  prop = 0.80,
+  strata = is_fraud
+)
+
+train_set <- training(
+  data_split
+)
+
+test_set <- testing(
+  data_split
+)
+
+prop.table(
+  table(train_set$is_fraud)
+)
+
+prop.table(
+  table(test_set$is_fraud)
+)
+```
+**6. Logistic Regression Model**
+
+**6.1 Prepare Data for Machine Learning**
+```{r,echo=TRUE}
+train_set <- train_set %>%
+  mutate(
+    is_fraud = factor(
+      if_else(
+        is_fraud == 1,
+        "fraud",
+        "legitimate"
+      ),
+      levels = c(
+        "legitimate",
+        "fraud"
+      )
+    )
+  )
+
+test_set <- test_set %>%
+  mutate(
+    is_fraud = factor(
+      if_else(
+        is_fraud == 1,
+        "fraud",
+        "legitimate"
+      ),
+      levels = c(
+        "legitimate",
+        "fraud"
+      )
+    )
+  )
+```
+**6.2 Create a Data Recipe**
+```{r,echo=TRUE}
+fraud_recipe <- recipe(
+  is_fraud ~ .,
+  data = train_set
+) %>%
+  update_role(
+    transaction_id,
+    new_role = "id"
+  ) %>%
+  step_string2factor(
+    all_nominal_predictors()
+  ) %>%
+  step_unknown(
+    all_nominal_predictors()
+  ) %>%
+  step_novel(
+    all_nominal_predictors()
+  ) %>%
+  step_impute_median(
+    all_numeric_predictors()
+  ) %>%
+  step_dummy(
+    all_nominal_predictors()
+  ) %>%
+  step_rm(
+    transaction_id
+  ) %>%
+  step_zv(
+    all_predictors()
+  ) %>%
+  step_normalize(
+    all_numeric_predictors()
+  )
+```
+**6.3 Build the Logistic Regression Model**
+```{r,echo=TRUE}
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_workflow <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(log_model)
+
+set.seed(123)
+
+log_fit <- fit(
+  log_workflow,
+  data = train_set
+)
+```
+**6.4 Predict Fraud**
+
+```{r,echo=TRUE}
+fraud_prob <- predict(
+  log_fit,
+  new_data = test_set,
+  type = "prob"
+)
+
+fraud_class <- predict(
+  log_fit,
+  new_data = test_set,
+  type = "class"
+)
+
+results <- bind_cols(
+  test_set %>%
+    select(is_fraud),
+  fraud_prob,
+  fraud_class
+)
+
+head(results)
+```
+**6.5 Evaluate Logistic Regression**
+```{r,echo=TRUE}
+pr_auc(
+  results,
+  truth = is_fraud,
+  .pred_fraud,
+  event_level = "second"
+)
+
+roc_auc(
+  results,
+  truth = is_fraud,
+  .pred_fraud,
+  event_level = "second"
+)
+
+conf_mat(
+  results,
+  truth = is_fraud,
+  estimate = .pred_class
+)
+
+metric_set(
+  precision,
+  recall,
+  f_meas
+)(
+  results,
+  truth = is_fraud,
+  estimate = .pred_class,
+  event_level = "second"
+)
+```
+**6.6 Test Different Classification Thresholds**
+```{r,echo=TRUE}
+threshold_results <- map_dfr(
+  c(
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.30,
+    0.50
+  ),
+  function(threshold) {
+
+    pred <- factor(
+      if_else(
+        results$.pred_fraud >= threshold,
+        "fraud",
+        "legitimate"
+      ),
+      levels = c(
+        "legitimate",
+        "fraud"
+      )
+    )
+
+    tibble(
+      threshold = threshold,
+
+      precision = precision_vec(
+        results$is_fraud,
+        pred,
+        event_level = "second"
+      ),
+
+      recall = recall_vec(
+        results$is_fraud,
+        pred,
+        event_level = "second"
+      ),
+
+      f1 = f_meas_vec(
+        results$is_fraud,
+        pred,
+        event_level = "second"
+      )
+    )
+  }
+)
+
+threshold_results
+```
+**7. Random Forest Model**
+
+**7.1 Build the Random Forest Model**
+
+```{r,echo=TRUE}
+rf_model <- rand_forest(
+  mtry = 5,
+  trees = 50,
+  min_n = 10
+) %>%
+  set_engine(
+    "ranger",
+    probability = TRUE,
+    class.weights = c(1, 10),
+    num.threads = 2
+  ) %>%
+  set_mode("classification")
+
+rf_workflow <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(rf_model)
+
+set.seed(123)
+
+rf_fit <- fit(
+  rf_workflow,
+  data = train_set
+)
+```
+**7.2 Evaluate the Random Forest Model**
+```{r,echo=TRUE}
+rf_prob <- predict(
+  rf_fit,
+  new_data = test_set,
+  type = "prob"
+)
+
+rf_results <- bind_cols(
+  test_set %>%
+    select(is_fraud),
+  rf_prob
+)
+
+pr_auc(
+  rf_results,
+  truth = is_fraud,
+  .pred_fraud,
+  event_level = "second"
+)
+
+roc_auc(
+  rf_results,
+  truth = is_fraud,
+  .pred_fraud,
+  event_level = "second"
+)
+```
+**7.3 Find an Appropriate Random Forest Threshold**
+```{r,echo=TRUE}
+rf_threshold_results <- map_dfr(
+  c(
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.30,
+    0.50
+  ),
+  function(threshold) {
+
+    pred <- factor(
+      if_else(
+        rf_results$.pred_fraud >= threshold,
+        "fraud",
+        "legitimate"
+      ),
+      levels = c(
+        "legitimate",
+        "fraud"
+      )
+    )
+
+    tibble(
+      threshold = threshold,
+
+      precision = precision_vec(
+        rf_results$is_fraud,
+        pred,
+        event_level = "second"
+      ),
+
+      recall = recall_vec(
+        rf_results$is_fraud,
+        pred,
+        event_level = "second"
+      ),
+
+      f1 = f_meas_vec(
+        rf_results$is_fraud,
+        pred,
+        event_level = "second"
+      )
+    )
+  }
+)
+
+rf_threshold_results
+```
+**8. Prepare Evaluation Data**
+
+**8.1 Keep Valid Evaluation Transactions**
+```{r,echo=TRUE}
+eval_valid <- transactions_eval_clean %>%
+  semi_join(
+    customers_join,
+    by = "customer_id"
+  ) %>%
+  semi_join(
+    merchants_join,
+    by = "merchant_id"
+  )
+
+transactions_eval_clean <- eval_valid %>%
+  distinct(
+    transaction_id,
+    .keep_all = TRUE
+  )
+```
+**8.2 Join Evaluation Data**
+```{r,echo=TRUE}
+eval_data <- transactions_eval_clean %>%
+  left_join(
+    customers_join,
+    by = "customer_id"
+  ) %>%
+  left_join(
+    merchants_join,
+    by = "merchant_id"
+  )
+
+head(eval_data)
+```
+**9. Prepare Evaluation Features**
+```{r,echo=TRUE}
+eval_model_data <- eval_data %>%
+  mutate(
+    amount_negative_flag = if_else(
+      !is.na(transaction_amount) &
+        transaction_amount < 0,
+      1L,
+      0L
+    ),
+
+    distance_negative_flag = if_else(
+      !is.na(distance_from_home_miles) &
+        distance_from_home_miles < 0,
+      1L,
+      0L
+    ),
+
+    transaction_amount = if_else(
+      transaction_amount < 0,
+      NA_real_,
+      transaction_amount
+    ),
+
+    distance_from_home_miles = if_else(
+      distance_from_home_miles < 0,
+      NA_real_,
+      distance_from_home_miles
+    ),
+
+    is_online = str_to_lower(
+      trimws(is_online)
+    ),
+
+    card_present = str_to_lower(
+      trimws(card_present)
+    ),
+
+    is_international = str_to_lower(
+      trimws(is_international)
+    ),
+
+    merchant_category = str_to_lower(
+      trimws(merchant_category)
+    ),
+
+    transaction_hour = hour(
+      transaction_datetime
+    ),
+
+    transaction_day = wday(
+      transaction_datetime,
+      label = TRUE
+    ),
+
+    transaction_month = month(
+      transaction_datetime
+    )
+  ) %>%
+  select(
+    transaction_id,
+    transaction_amount,
+    is_online,
+    card_present,
+    distance_from_home_miles,
+    hours_since_last_txn,
+    ratio_to_median_purchase,
+    num_txns_last_24h,
+    amount_negative_flag,
+    distance_negative_flag,
+    account_age_days,
+    merchant_category,
+    is_international,
+    transaction_hour,
+    transaction_day,
+    transaction_month
+  )
+
+head(eval_model_data)
+```
+**10. Preserve Unique Evaluation Transactions**
+```{r,echo=TRUE}
+eval_source <- transactions_eval %>%
+  mutate(
+    customer_valid =
+      customer_id %in%
+      customers_join$customer_id,
+
+    merchant_valid =
+      merchant_id %in%
+      merchants_join$merchant_id,
+
+    both_valid =
+      customer_valid &
+      merchant_valid
+  ) %>%
+  arrange(
+    transaction_id,
+    desc(both_valid),
+    desc(customer_valid),
+    desc(merchant_valid)
+  ) %>%
+  distinct(
+    transaction_id,
+    .keep_all = TRUE
+  ) %>%
+  select(
+    -customer_valid,
+    -merchant_valid,
+    -both_valid
+  )
+
+eval_source
+```
+**11. Predict Fraud Probabilities**
+
+The Random Forest model is used to predict the probability that each evaluation transaction is fraudulent.
+```{r,echo=TRUE}
+rf_predictions <- predict(
+  rf_fit,
+  new_data = eval_model_data,
+  type = "prob"
+)
+
+head(rf_predictions)
+dim(rf_predictions)
+```
+**12. Create Submission File**
+```{r,echo=TRUE}
+submission <- tibble(
+  transaction_id =
+    eval_model_data$transaction_id,
+
+  fraud_probability =
+    rf_predictions$.pred_fraud
+)
+
+head(submission)
+```
+```{r,echo=TRUE}
+write.csv(
+  submission,
+  "fraud_submission.csv",
+  row.names = FALSE
+)
+```
+**Conclusion**
+
+This project applies a complete fraud detection workflow:
+
+Load and validate transaction data.
+
+Remove duplicate and invalid transactions.
+
+Identify and handle unusual values.
+
+Merge transaction, customer, and merchant data.
+
+Create features for machine learning.
+
+Build and evaluate a Logistic Regression model.
+
+Build and evaluate a Random Forest model.
+
+Select appropriate classification thresholds.
+
+Predict fraud probabilities for evaluation transactions.
+
+The final output is the submission dataset, which contains each transaction ID and its predicted fraud probability
